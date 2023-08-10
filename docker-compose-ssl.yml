@@ -80,7 +80,7 @@ services:
     networks:
       - local
 
-  web:
+  webtorrent:
     container_name: webtorrent
     restart: unless-stopped
     image: dperson/nginx
