@@ -1,0 +1,241 @@
+version: "3"
+services:
+  traefik:
+    image: traefik:v2.9.1
+    restart: always
+    container_name: traefik
+    command:
+      # Log
+      - '--accesslog=false'
+      # Globals
+      - "--log.level=INFO"
+      - "--api.dashboard=true"
+      # Docker
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.endpoint=unix:///var/run/docker.sock"
+      # Entrypoints
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      # LetsEncrypt 
+      - "--certificatesresolvers.mydnschallenge.acme.email=${CLOUDLFARE_EMAIL}"
+      - "--certificatesresolvers.mydnschallenge.acme.dnschallenge.provider=cloudflare"
+      - "--certificatesresolvers.mydnschallenge.acme.storage=/letsencrypt/acme.json"
+      - "--serverstransport.insecureskipverify=true"
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # ACME Settings 
+      - CLOUDFLARE_EMAIL=${CLOUDFLARE_EMAIL}
+      - CLOUDFLARE_API_KEY=${CLOUDFLARE_API_KEY}
+    volumes:
+      - "./traefik/access:/access"
+      - "./letsencrypt:/letsencrypt"
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    labels:
+      # API-Dashboard
+      - "traefik.enable=true"
+      - "traefik.http.routers.api.rule=Host(`${TRAEFIK_DOMAIN}`)"
+      - "traefik.http.routers.api.service=api@internal"
+      - "traefik.http.routers.api.entrypoints=websecure"
+      - "traefik.http.routers.api.tls.certresolver=mydnschallenge"
+      # Global http-->https
+      - "traefik.http.routers.http-catchall.rule=hostregexp(`{host:[a-z-.]+}`)"
+      - "traefik.http.routers.http-catchall.entrypoints=web"
+      - "traefik.http.routers.http-catchall.middlewares=redirect-to-https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+    networks:
+      - web
+
+
+  vpn:
+    restart: unless-stopped
+    image: ghcr.io/bubuntux/nordlynx:edge
+    cap_add:
+      - NET_ADMIN #required
+      - SYS_MODULE
+    sysctls:
+      - "net.ipv4.conf.all.src_valid_mark=1"
+      - "net.ipv6.conf.all.disable_ipv6=1"
+    environment:
+      - PRIVATE_KEY=${NORDVPN_PRIVATE_KEY} #required
+      - DNS=1.1.1.1
+      - QUERY=filters\[servers_groups\]\[identifier\]=legacy_p2p
+    networks:
+      - local
+
+  torrent:
+    image: linuxserver/deluge
+    network_mode: service:vpn
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+    volumes:
+      - ./deluge:/config
+      - ${TORRENT_DOWNLOADS}:/downloads
+    depends_on:
+      - vpn
+    networks:
+      - local
+
+  web:
+    container_name: webtorrent
+    restart: unless-stopped
+    image: dperson/nginx
+    links:
+      - vpn:torrent
+    depends_on:
+      - torrent
+    tmpfs:
+      - /run
+      - /tmp
+      - /var/cache/nginx
+    expose:
+      - 80
+    command: -w "http://torrent:8112/;/"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+      - "traefik.http.routers.torrent.rule=Host(`${TORRENT_DOMAIN}`)"
+      - "traefik.http.routers.torrent.entrypoints=websecure"
+      - "traefik.http.routers.torrent.tls.certresolver=mydnschallenge"
+    networks:
+      - web
+      - local
+
+  jellyfin:
+    image: jellyfin/jellyfin
+    container_name: jellyfin
+    user: 1000:1000
+    volumes:
+      - ./jellyfin/config:/config
+      - ./jellyfin/cache:/cache
+      - ${SHOW_DIR}:/media/shows:ro
+      - ${MOVIE_DIR}:/media/movies:ro
+    restart: always
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.services.jelly.loadbalancer.server.port=8096"
+      - "traefik.http.routers.jelly.rule=Host(`${JELLYFIN_DOMAIN}`)"
+      - "traefik.http.routers.jelly.tls.certresolver=mydnschallenge"
+      - "traefik.http.routers.jelly.entrypoints=websecure"
+    networks:
+      - web
+
+  sonarr:
+    container_name: sonarr
+    image: lscr.io/linuxserver/sonarr:latest
+    restart: always
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Vienna
+    links:
+      - webtorrent
+      - prowlarr
+    volumes:
+      - ./sonarr:/config
+      - ${TORRENT_DOWNLOADS}:/downloads
+      - ${SHOW_DIR}:/shows
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.sonarr.rule=Host(`${SONARR_DOMAIN}`)"
+      - "traefik.http.routers.sonarr.entrypoints=websecure"
+      - "traefik.http.routers.sonarr.tls.certresolver=mydnschallenge"
+      - "traefik.http.services.sonarr_sonarr.loadbalancer.server.port=8989"
+    networks:
+      - web
+
+
+  radarr:
+    container_name: radarr
+    image: lscr.io/linuxserver/radarr:latest
+    restart: always
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Vienna
+    links:
+      - webtorrent
+      - prowlarr
+    volumes:
+      - ./radarr:/config
+      - ${TORRENT_DOWNLOADS}:/downloads
+      - ${MOVIE_DIR}:/movies
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.radarr.rule=Host(`${RADARR_DOMAIN}`)"
+      - "traefik.http.routers.radarr.entrypoints=websecure"
+      - "traefik.http.routers.radarr.tls.certresolver=mydnschallenge"
+      - "traefik.http.services.radarr-radarr.loadbalancer.server.port=7878"
+    networks:
+      - web
+
+
+  overseerr:
+    container_name: overseerr
+    image: fallenbagel/jellyseerr:latest
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Vienna
+    volumes:
+      - ./overseerr:/app/config
+    links:
+      - radarr
+      - sonarr
+      - jellyfin
+    restart: always
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.overeerr.rule=Host(`${OVERSEERR_DOMAIN}`)"
+      - "traefik.http.routers.overeerr.entrypoints=websecure"
+      - "traefik.http.routers.overeerr.tls.certresolver=mydnschallenge"
+      - "traefik.http.services.overseerr-overseerr.loadbalancer.server.port=5055"
+    networks:
+      - web
+
+  prowlarr:
+    container_name: prowlarr
+    image: lscr.io/linuxserver/prowlarr:latest
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Vienna
+    volumes:
+      - ./prowlarr:/config
+    links:
+      - sonarr
+      - radarr
+      - flaresolverr
+    restart: always
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.prowlarr.rule=Host(`${PROWLARR_DOMAIN}`)"
+      - "traefik.http.routers.prowlarr.entrypoints=websecure"
+      - "traefik.http.routers.prowlarr.tls.certresolver=mydnschallenge"
+      - "traefik.http.services.prowlarr-prowlarr.loadbalancer.server.port=9696"
+    networks:
+      - web
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - LOG_HTML=${LOG_HTML:-false}
+      - CAPTCHA_SOLVER=${CAPTCHA_SOLVER:-none}
+      - TZ=Europe/Vienna
+    expose:
+      - "8191"
+    restart: always
+    networks:
+      - web
+
+networks:
+  web:
+    name: web
+
+  local:
