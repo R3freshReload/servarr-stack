@@ -207,8 +207,6 @@ services:
     volumes:
       - ./prowlarr:/config
     links:
-      - sonarr
-      - radarr
       - flaresolverr
     restart: always
     labels:
